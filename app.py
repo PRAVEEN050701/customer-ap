@@ -1,9 +1,7 @@
 import os
 from flask import Flask, jsonify, request
 import mysql.connector
-import os
-from flask import Flask, jsonify, request
-import mysql.connector
+
 
 app = Flask(__name__)
 
@@ -96,7 +94,19 @@ def search_customers():
         return jsonify({
             "error": "Customer name is required"
         }), 400
+    limit = request.args.get("limit", "10")
 
+    try:
+       limit = int(limit)
+    except ValueError:
+      return jsonify({
+        "error": "Limit must be a number"
+    }), 400
+
+    if limit <= 0:
+     return jsonify({
+        "error": "Limit must be greater than 0"
+    }), 400
     try:
         connection = mysql.connector.connect(
             host=DB_HOST,
