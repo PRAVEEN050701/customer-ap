@@ -90,13 +90,11 @@ def db_test():
 
 @app.route("/customers/search")
 def search_customers():
+    name = request.args.get("name", "").strip()
 
-    name = request.args.get("name")
-
-    # Validate search input
     if not name:
         return jsonify({
-            "error": "Please provide a customer name"
+            "error": "Customer name is required"
         }), 400
 
     try:
