@@ -2,6 +2,7 @@ pipeline {
     agent any
 
     parameters {
+
         choice(
             name: 'ENVIRONMENT',
             choices: ['DEV', 'UAT', 'PRODUCTION'],
@@ -31,11 +32,6 @@ pipeline {
             choices: ['NO', 'YES'],
             description: 'Required for production deployment'
         )
-    }
-
-    environment {
-        DB_USER = 'customer'
-        DB_NAME = 'customerdb'
     }
 
     stages {
@@ -72,7 +68,7 @@ pipeline {
                         env.IMAGE = 'customer-app-prod'
 
                     } else {
-                        error "Invalid environment selected"
+                        error "Invalid environment"
                     }
 
                     echo "============================================"
@@ -116,15 +112,16 @@ pipeline {
 
         stage('Checkout Correct Branch') {
             steps {
-                echo "Checking out branch: ${env.BRANCH}"
+                script {
 
-                checkout([
-                    $class: 'GitSCM',
-                    branches: [[name: "*/${env.BRANCH}"]],
-                    userRemoteConfigs: [[
-                        url: 'YOUR_GITHUB_REPOSITORY_URL'
-                    ]]
-                ])
+                    echo "Checking out branch: ${env.BRANCH}"
+
+                    checkout([
+                        $class: 'GitSCM',
+                        branches: [[name: "*/${env.BRANCH}"]],
+                        userRemoteConfigs: scm.userRemoteConfigs
+                    ])
+                }
             }
         }
 
@@ -143,6 +140,12 @@ pipeline {
         }
 
         stage('Validate Docker Image') {
+            when {
+                expression {
+                    params.ACTION == 'DEPLOY'
+                }
+            }
+
             steps {
                 bat """
                     docker image inspect ${env.IMAGE}:${params.VERSION}
@@ -182,7 +185,7 @@ pipeline {
                             -e DB_HOST=${env.DB} ^
                             -e DB_USER=%CUSTOMER_DB_USER% ^
                             -e DB_PASSWORD=%CUSTOMER_DB_PASSWORD% ^
-                            -e DB_NAME=${env.DB_NAME} ^
+                            -e DB_NAME=customerdb ^
                             ${env.IMAGE}:${params.VERSION}
                         """
                     }
@@ -222,37 +225,21 @@ pipeline {
             }
 
             steps {
-                script {
+                powershell """
+                    \$response = Invoke-WebRequest `
+                        -Uri "http://localhost:${env.PORT}/health" `
+                        -UseBasicParsing
 
-                    def health = powershell(
-                        returnStatus: true,
-                        script: """
-                            try {
-                                \$response = Invoke-WebRequest `
-                                    -Uri "http://localhost:${env.PORT}/health" `
-                                    -UseBasicParsing
+                    Write-Host \$response.Content
 
-                                Write-Host \$response.Content
-
-                                if (\$response.StatusCode -ne 200) {
-                                    exit 1
-                                }
-                            }
-                            catch {
-                                Write-Host \$_.Exception.Message
-                                exit 1
-                            }
-                        """
-                    )
-
-                    if (health != 0) {
-                        error "Application health check failed"
+                    if (\$response.StatusCode -ne 200) {
+                        exit 1
                     }
-                }
+                """
             }
         }
 
-        stage('Application to Database Check') {
+        stage('Application Database Check') {
             when {
                 expression {
                     params.RUN_TESTS == 'YES'
@@ -262,21 +249,14 @@ pipeline {
             steps {
                 script {
 
-                    def dbTest = powershell(
-                        returnStatus: true,
-                        script: """
-                            docker exec ${env.APP} python -c "import urllib.request; print(urllib.request.urlopen('http://localhost:8081/db-test').read().decode())"
-                        """
-                    )
-
-                    if (dbTest != 0) {
-                        error "Application cannot connect to database"
-                    }
+                    bat """
+                        docker exec ${env.APP} python -c "import urllib.request; print(urllib.request.urlopen('http://localhost:8081/db-test').read().decode())"
+                    """
                 }
             }
         }
 
-        stage('Environment and Version Validation') {
+        stage('Environment Version Validation') {
             when {
                 expression {
                     params.RUN_TESTS == 'YES'
@@ -284,35 +264,27 @@ pipeline {
             }
 
             steps {
-                script {
+                powershell """
+                    \$response = Invoke-RestMethod `
+                        "http://localhost:${env.PORT}/health"
 
-                    def validation = powershell(
-                        returnStdout: true,
-                        script: """
-                            \$response = Invoke-RestMethod `
-                                "http://localhost:${env.PORT}/health"
+                    Write-Host "Environment: \$response.environment"
+                    Write-Host "Version: \$response.version"
 
-                            Write-Host "Environment: \$response.environment"
-                            Write-Host "Version: \$response.version"
+                    if ("\$response.environment" -ne "${params.ENVIRONMENT}") {
+                        Write-Error "Environment mismatch"
+                        exit 1
+                    }
 
-                            if ("\$response.environment" -ne "${params.ENVIRONMENT}") {
-                                Write-Error "Environment mismatch"
-                                exit 1
-                            }
-
-                            if ("\$response.version" -ne "${params.VERSION}") {
-                                Write-Error "Version mismatch"
-                                exit 1
-                            }
-                        """
-                    )
-
-                    echo validation
-                }
+                    if ("\$response.version" -ne "${params.VERSION}") {
+                        Write-Error "Version mismatch"
+                        exit 1
+                    }
+                """
             }
         }
 
-        stage('Rollback') {
+        stage('Manual Rollback') {
             when {
                 expression {
                     params.ACTION == 'ROLLBACK'
@@ -320,55 +292,56 @@ pipeline {
             }
 
             steps {
-                echo "Restoring previous production version..."
+                script {
 
-                bat """
-                    docker rm -f ${env.APP} 2>nul || exit /b 0
-                """
-
-                withCredentials([
-                    usernamePassword(
-                        credentialsId: 'customer-db-creds',
-                        usernameVariable: 'CUSTOMER_DB_USER',
-                        passwordVariable: 'CUSTOMER_DB_PASSWORD'
-                    )
-                ]) {
+                    echo "Restoring production version 5.0"
 
                     bat """
-                        docker run -d ^
-                        --name ${env.APP} ^
-                        --network ${env.NETWORK} ^
-                        -p ${env.PORT}:8081 ^
-                        -e APP_ENV=PRODUCTION ^
-                        -e APP_VERSION=5.0 ^
-                        -e DB_HOST=${env.DB} ^
-                        -e DB_USER=%CUSTOMER_DB_USER% ^
-                        -e DB_PASSWORD=%CUSTOMER_DB_PASSWORD% ^
-                        -e DB_NAME=${env.DB_NAME} ^
-                        ${env.IMAGE}:5.0
+                        docker rm -f ${env.APP} 2>nul || exit /b 0
                     """
+
+                    withCredentials([
+                        usernamePassword(
+                            credentialsId: 'customer-db-creds',
+                            usernameVariable: 'CUSTOMER_DB_USER',
+                            passwordVariable: 'CUSTOMER_DB_PASSWORD'
+                        )
+                    ]) {
+
+                        bat """
+                            docker run -d ^
+                            --name ${env.APP} ^
+                            --network ${env.NETWORK} ^
+                            -p ${env.PORT}:8081 ^
+                            -e APP_ENV=PRODUCTION ^
+                            -e APP_VERSION=5.0 ^
+                            -e DB_HOST=${env.DB} ^
+                            -e DB_USER=%CUSTOMER_DB_USER% ^
+                            -e DB_PASSWORD=%CUSTOMER_DB_PASSWORD% ^
+                            -e DB_NAME=customerdb ^
+                            ${env.IMAGE}:5.0
+                        """
+                    }
                 }
             }
         }
 
-        stage('Final Validation') {
+        stage('Final Docker Validation') {
             steps {
-                bat """
-                    docker ps
-                """
 
-                bat """
-                    docker network inspect ${env.NETWORK}
-                """
+                bat "docker ps"
 
-                bat """
-                    docker volume ls
-                """
+                bat "docker network inspect ${env.NETWORK}"
+
+                bat "docker image inspect ${env.IMAGE}:${params.VERSION}"
+
+                bat "docker volume ls"
             }
         }
     }
 
     post {
+
         success {
             echo "============================================"
             echo "DEPLOYMENT SUCCESS"
