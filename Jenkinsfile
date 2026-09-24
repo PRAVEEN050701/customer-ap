@@ -1,0 +1,390 @@
+pipeline {
+    agent any
+
+    parameters {
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['DEV', 'UAT', 'PRODUCTION'],
+            description: 'Select deployment environment'
+        )
+
+        choice(
+            name: 'ACTION',
+            choices: ['DEPLOY', 'ROLLBACK'],
+            description: 'Select deployment action'
+        )
+
+        string(
+            name: 'VERSION',
+            defaultValue: '5.0',
+            description: 'Application version'
+        )
+
+        choice(
+            name: 'RUN_TESTS',
+            choices: ['YES', 'NO'],
+            description: 'Run deployment validation'
+        )
+
+        choice(
+            name: 'PRODUCTION_CONFIRM',
+            choices: ['NO', 'YES'],
+            description: 'Required for production deployment'
+        )
+    }
+
+    environment {
+        DB_USER = 'customer'
+        DB_NAME = 'customerdb'
+    }
+
+    stages {
+
+        stage('Resolve Configuration') {
+            steps {
+                script {
+
+                    if (params.ENVIRONMENT == 'DEV') {
+
+                        env.BRANCH = 'develop'
+                        env.APP = 'customer--dev--app'
+                        env.DB = 'customer--dev--db'
+                        env.NETWORK = 'customer--dev--net'
+                        env.PORT = '8081'
+                        env.IMAGE = 'customer-app-dev'
+
+                    } else if (params.ENVIRONMENT == 'UAT') {
+
+                        env.BRANCH = 'release'
+                        env.APP = 'customer--uat--app'
+                        env.DB = 'customer--uat--db'
+                        env.NETWORK = 'customer--uat--net'
+                        env.PORT = '8082'
+                        env.IMAGE = 'customer-app-uat'
+
+                    } else if (params.ENVIRONMENT == 'PRODUCTION') {
+
+                        env.BRANCH = 'main'
+                        env.APP = 'customer--prod--app'
+                        env.DB = 'customer--prod--db'
+                        env.NETWORK = 'customer--prod--net'
+                        env.PORT = '8083'
+                        env.IMAGE = 'customer-app-prod'
+
+                    } else {
+                        error "Invalid environment selected"
+                    }
+
+                    echo "============================================"
+                    echo "RESOLVED DEPLOYMENT CONFIGURATION"
+                    echo "============================================"
+                    echo "Environment : ${params.ENVIRONMENT}"
+                    echo "Branch      : ${env.BRANCH}"
+                    echo "Application : ${env.APP}"
+                    echo "Database    : ${env.DB}"
+                    echo "Network     : ${env.NETWORK}"
+                    echo "Host Port   : ${env.PORT}"
+                    echo "Image       : ${env.IMAGE}"
+                    echo "Version     : ${params.VERSION}"
+                    echo "Action      : ${params.ACTION}"
+                    echo "Run Tests   : ${params.RUN_TESTS}"
+                    echo "============================================"
+                }
+            }
+        }
+
+        stage('Validate Parameters') {
+            steps {
+                script {
+
+                    if (
+                        params.ENVIRONMENT == 'PRODUCTION' &&
+                        params.PRODUCTION_CONFIRM != 'YES'
+                    ) {
+                        error "Production deployment requires PRODUCTION_CONFIRM = YES"
+                    }
+
+                    if (
+                        params.ACTION == 'ROLLBACK' &&
+                        params.ENVIRONMENT != 'PRODUCTION'
+                    ) {
+                        error "ROLLBACK is allowed only for PRODUCTION"
+                    }
+                }
+            }
+        }
+
+        stage('Checkout Correct Branch') {
+            steps {
+                echo "Checking out branch: ${env.BRANCH}"
+
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: "*/${env.BRANCH}"]],
+                    userRemoteConfigs: [[
+                        url: 'YOUR_GITHUB_REPOSITORY_URL'
+                    ]]
+                ])
+            }
+        }
+
+        stage('Build Docker Image') {
+            when {
+                expression {
+                    params.ACTION == 'DEPLOY'
+                }
+            }
+
+            steps {
+                bat """
+                    docker build -t ${env.IMAGE}:${params.VERSION} .
+                """
+            }
+        }
+
+        stage('Validate Docker Image') {
+            steps {
+                bat """
+                    docker image inspect ${env.IMAGE}:${params.VERSION}
+                """
+            }
+        }
+
+        stage('Deploy Application') {
+            when {
+                expression {
+                    params.ACTION == 'DEPLOY'
+                }
+            }
+
+            steps {
+                script {
+
+                    bat """
+                        docker rm -f ${env.APP} 2>nul || exit /b 0
+                    """
+
+                    withCredentials([
+                        usernamePassword(
+                            credentialsId: 'customer-db-creds',
+                            usernameVariable: 'CUSTOMER_DB_USER',
+                            passwordVariable: 'CUSTOMER_DB_PASSWORD'
+                        )
+                    ]) {
+
+                        bat """
+                            docker run -d ^
+                            --name ${env.APP} ^
+                            --network ${env.NETWORK} ^
+                            -p ${env.PORT}:8081 ^
+                            -e APP_ENV=${params.ENVIRONMENT} ^
+                            -e APP_VERSION=${params.VERSION} ^
+                            -e DB_HOST=${env.DB} ^
+                            -e DB_USER=%CUSTOMER_DB_USER% ^
+                            -e DB_PASSWORD=%CUSTOMER_DB_PASSWORD% ^
+                            -e DB_NAME=${env.DB_NAME} ^
+                            ${env.IMAGE}:${params.VERSION}
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Application Container Check') {
+            steps {
+                bat """
+                    docker inspect -f "{{.State.Running}}" ${env.APP}
+                """
+            }
+        }
+
+        stage('Database Container Check') {
+            steps {
+                bat """
+                    docker inspect -f "{{.State.Running}}" ${env.DB}
+                """
+            }
+        }
+
+        stage('Network Validation') {
+            steps {
+                bat """
+                    docker network inspect ${env.NETWORK}
+                """
+            }
+        }
+
+        stage('Health Check') {
+            when {
+                expression {
+                    params.RUN_TESTS == 'YES'
+                }
+            }
+
+            steps {
+                script {
+
+                    def health = powershell(
+                        returnStatus: true,
+                        script: """
+                            try {
+                                \$response = Invoke-WebRequest `
+                                    -Uri "http://localhost:${env.PORT}/health" `
+                                    -UseBasicParsing
+
+                                Write-Host \$response.Content
+
+                                if (\$response.StatusCode -ne 200) {
+                                    exit 1
+                                }
+                            }
+                            catch {
+                                Write-Host \$_.Exception.Message
+                                exit 1
+                            }
+                        """
+                    )
+
+                    if (health != 0) {
+                        error "Application health check failed"
+                    }
+                }
+            }
+        }
+
+        stage('Application to Database Check') {
+            when {
+                expression {
+                    params.RUN_TESTS == 'YES'
+                }
+            }
+
+            steps {
+                script {
+
+                    def dbTest = powershell(
+                        returnStatus: true,
+                        script: """
+                            docker exec ${env.APP} python -c "import urllib.request; print(urllib.request.urlopen('http://localhost:8081/db-test').read().decode())"
+                        """
+                    )
+
+                    if (dbTest != 0) {
+                        error "Application cannot connect to database"
+                    }
+                }
+            }
+        }
+
+        stage('Environment and Version Validation') {
+            when {
+                expression {
+                    params.RUN_TESTS == 'YES'
+                }
+            }
+
+            steps {
+                script {
+
+                    def validation = powershell(
+                        returnStdout: true,
+                        script: """
+                            \$response = Invoke-RestMethod `
+                                "http://localhost:${env.PORT}/health"
+
+                            Write-Host "Environment: \$response.environment"
+                            Write-Host "Version: \$response.version"
+
+                            if ("\$response.environment" -ne "${params.ENVIRONMENT}") {
+                                Write-Error "Environment mismatch"
+                                exit 1
+                            }
+
+                            if ("\$response.version" -ne "${params.VERSION}") {
+                                Write-Error "Version mismatch"
+                                exit 1
+                            }
+                        """
+                    )
+
+                    echo validation
+                }
+            }
+        }
+
+        stage('Rollback') {
+            when {
+                expression {
+                    params.ACTION == 'ROLLBACK'
+                }
+            }
+
+            steps {
+                echo "Restoring previous production version..."
+
+                bat """
+                    docker rm -f ${env.APP} 2>nul || exit /b 0
+                """
+
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'customer-db-creds',
+                        usernameVariable: 'CUSTOMER_DB_USER',
+                        passwordVariable: 'CUSTOMER_DB_PASSWORD'
+                    )
+                ]) {
+
+                    bat """
+                        docker run -d ^
+                        --name ${env.APP} ^
+                        --network ${env.NETWORK} ^
+                        -p ${env.PORT}:8081 ^
+                        -e APP_ENV=PRODUCTION ^
+                        -e APP_VERSION=5.0 ^
+                        -e DB_HOST=${env.DB} ^
+                        -e DB_USER=%CUSTOMER_DB_USER% ^
+                        -e DB_PASSWORD=%CUSTOMER_DB_PASSWORD% ^
+                        -e DB_NAME=${env.DB_NAME} ^
+                        ${env.IMAGE}:5.0
+                    """
+                }
+            }
+        }
+
+        stage('Final Validation') {
+            steps {
+                bat """
+                    docker ps
+                """
+
+                bat """
+                    docker network inspect ${env.NETWORK}
+                """
+
+                bat """
+                    docker volume ls
+                """
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "============================================"
+            echo "DEPLOYMENT SUCCESS"
+            echo "Environment : ${params.ENVIRONMENT}"
+            echo "Version     : ${params.VERSION}"
+            echo "Action      : ${params.ACTION}"
+            echo "============================================"
+        }
+
+        failure {
+            echo "============================================"
+            echo "DEPLOYMENT FAILED"
+            echo "Environment : ${params.ENVIRONMENT}"
+            echo "Version     : ${params.VERSION}"
+            echo "Action      : ${params.ACTION}"
+            echo "============================================"
+        }
+    }
+}
