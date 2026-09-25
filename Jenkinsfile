@@ -246,4 +246,131 @@ pipeline {
 
             steps {
                 bat """
+                    curl.exe -f http://localhost:${env.PORT}/health
+                """
+            }
+        }
+
+        stage('Application Database Check') {
+            when {
+                expression {
+                    params.RUN_TESTS == 'YES' &&
+                    params.ACTION == 'DEPLOY'
+                }
+            }
+
+            steps {
+                bat """
+                    docker exec ${env.APP} python -c "import urllib.request; print(urllib.request.urlopen('http://localhost:8081/db-test').read().decode())"
+                """
+            }
+        }
+
+        stage('Environment Version Validation') {
+            when {
+                expression {
+                    params.RUN_TESTS == 'YES' &&
+                    params.ACTION == 'DEPLOY'
+                }
+            }
+
+            steps {
+                bat """
+                    curl.exe -f http://localhost:${env.PORT}/health
+                """
+            }
+        }
+
+        stage('Manual Rollback') {
+            when {
+                expression {
+                    params.ACTION == 'ROLLBACK'
+                }
+            }
+
+            steps {
+                script {
+
+                    if (params.ENVIRONMENT != 'PRODUCTION') {
+                        error "Rollback is only supported for PRODUCTION"
+                    }
+
+                    echo "Restoring production version 5.0"
+
+                    bat """
+                        docker rm -f ${env.APP} 2>nul
+                        exit /b 0
+                    """
+
+                    withCredentials([
+                        usernamePassword(
+                            credentialsId: 'customer-db-creds',
+                            usernameVariable: 'CUSTOMER_DB_USER',
+                            passwordVariable: 'CUSTOMER_DB_PASSWORD'
+                        )
+                    ]) {
+
+                        bat """
+                            docker run -d ^
+                            --name ${env.APP} ^
+                            --network ${env.NETWORK} ^
+                            -p ${env.PORT}:8081 ^
+                            -e APP_ENV=PRODUCTION ^
+                            -e APP_VERSION=5.0 ^
+                            -e DB_HOST=${env.DB} ^
+                            -e DB_USER=%CUSTOMER_DB_USER% ^
+                            -e DB_PASSWORD=%CUSTOMER_DB_PASSWORD% ^
+                            -e DB_NAME=customerdb ^
+                            ${env.IMAGE}:5.0
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Final Validation') {
+            steps {
+
+                bat """
+                    docker ps
+                """
+
+                bat """
+                    docker network inspect ${env.NETWORK}
+                """
+
+                bat """
+                    docker image inspect ${env.IMAGE}:${params.ACTION == 'ROLLBACK' ? '5.0' : params.VERSION}
+                """
+
+                bat """
+                    docker volume ls
+                """
+            }
+        }
+    }
+
+    post {
+
+        success {
+            echo "============================================"
+            echo "DEPLOYMENT SUCCESS"
+            echo "============================================"
+            echo "Environment : ${params.ENVIRONMENT}"
+            echo "Version     : ${params.ACTION == 'ROLLBACK' ? '5.0' : params.VERSION}"
+            echo "Action      : ${params.ACTION}"
+            echo "============================================"
+        }
+
+        failure {
+            echo "============================================"
+            echo "DEPLOYMENT FAILED"
+            echo "============================================"
+            echo "Environment : ${params.ENVIRONMENT}"
+            echo "Version     : ${params.VERSION}"
+            echo "Action      : ${params.ACTION}"
+            echo "============================================"
+        }
+    }
+}
 
