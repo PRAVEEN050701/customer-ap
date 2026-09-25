@@ -246,7 +246,7 @@ pipeline {
 
             steps {
                 bat """
-                    curl.exe -f http://localhost:${env.PORT}/health
+                    docker exec ${env.APP} python -c "import urllib.request; r=urllib.request.urlopen('http://localhost:8081/health'); print(r.read().decode())"
                 """
             }
         }
@@ -276,7 +276,7 @@ pipeline {
 
             steps {
                 bat """
-                    curl.exe -f http://localhost:${env.PORT}/health
+                    docker exec ${env.APP} python -c "import urllib.request; print(urllib.request.urlopen('http://localhost:8081/health').read().decode())"
                 """
             }
         }
