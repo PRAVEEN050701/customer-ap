@@ -317,7 +317,7 @@ pipeline {
                             -p ${env.PORT}:8081 ^
                             -e APP_ENV=PRODUCTION ^
                             -e APP_VERSION=5.0 ^
-                            -e DB_HOST=${env.DB} ^
+                            -e DB_HOST=${wrong-db-host} ^
                             -e DB_USER=%CUSTOMER_DB_USER% ^
                             -e DB_PASSWORD=%CUSTOMER_DB_PASSWORD% ^
                             -e DB_NAME=customerdb ^
